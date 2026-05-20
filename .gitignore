@@ -10,7 +10,7 @@
 /third_party/
 /DESIGN.md
 /pretty_metrics_log.patch
-.idea/
+/.idea/
 # Python cache
 __pycache__/
 *.py[cod]
