@@ -1,7 +1,9 @@
 # MoE Prune & Distill
 
 针对 Qwen3.5 MoE 系列大模型的 **结构化专家剪枝 + LoRA 蒸馏修复** 工具链，
-目标硬件单张 16GB GPU。详细设计见 [DESIGN.md](DESIGN.md)。
+目标硬件单张 16GB GPU。
+
+本项目使用Claude Code完成。
 
 ## 安装
 
@@ -9,15 +11,14 @@
 pip install -r requirements.txt
 pip install -e .
 ```
-
-依赖 `transformers>=5.x`（含 `qwen3_5_moe` 模型）、`bitsandbytes`、`peft`、
-`accelerate`、`safetensors`。**Linux / WSL2 推荐**：Windows 上 `bitsandbytes`
-可能不可用。
-
-## 端到端流程（推荐）
-
+如果要训练，可能还需要triton （required by muon_triton.py)
+## 端到端流程
+1. 在example.yaml中设置要蒸馏的模型
+2. 在data_sources.yaml中配置token限制以及HF_TOKEN
+3. stream_teacher会生成大量（40GB~无上限，取决于样本数）中间激活值
+4. 最后一步是sft，不必要
 ```bash
-python -m scripts.download           --config configs/example.yaml
+python -m scripts.download           --config configs/example.yaml                # 下载模型
 python -m scripts.inspect            --config configs/example.yaml
 python -m scripts.build_train_set    --config configs/data_sources.yaml --smoke   # 验证
 python -m scripts.build_train_set    --config configs/data_sources.yaml           # 正式
@@ -118,13 +119,12 @@ python -m scripts.collect_router_stats --config configs/example.yaml
 python -m scripts.cache_teacher        --config configs/example.yaml --offload-folder ./cache/offload
 ```
 
-测试：`pytest -q`（78 个用例：P0 + P1 + 流式等价性 + layerwise + 专家融合
-+ SSO 优化器 + 指标/调度/val split）。
+测试：`pytest -q`
 
 ## 训练可观测性
 
 `scripts/train.py` 与 `scripts/train_layerwise.py` 共用三套基础设施
-（详见 [DESIGN.md §7.5](DESIGN.md)）：
+：
 
 **LR 调度**：cosine（默认）/ linear / constant + warmup。
 
@@ -239,40 +239,3 @@ python -m scripts.build_train_set --config configs/data_sources.yaml
   - `scripts/prefetch_datasets.py --only <name>`：调
     `huggingface_hub.snapshot_download` 一次性把指定源拉到本地缓存，
     给 OpenHermes-2.5 这类 6GB 单文件用。
-
-镜像下踩坑全档案见 [memory/2026-05-17.md §6](memory/2026-05-17.md)。
-
-## 状态 / 已知问题
-
-- **测试**：78/78 通过（P0 7 + P1 24 含专家融合 6 + streamer 3 + layerwise 9
-  + SSO 优化器 16 + 指标 10 + LR 调度 8）。在带 CUDA 的机器上额外 1 个 layerwise 收敛测试覆盖
-  `batch_size>1 + grad_accum>1` 路径（CPU 上由 fla Triton kernel 跳过）。
-  SSO 测试覆盖 NaN 兜底（tiny / zero / partial-dead-expert / NaN-safe
-  bisection / preserve-radius 保留 σ_init / NaN-grad 跳过）。
-- **prune 内存峰值**：流式重写后 ≤ 6GB（先前 30+GB），可在 16GB 物理内存机器跑通。
-- **layerwise GPU 峰值**：4 层 bf16 + 8bit AdamW + checkpointing 下 < 8GB。
-  先 layerwise 做 block-wise 对齐再走 train.py 端到端，比直接 4bit + LoRA 端到端
-  起点显著更低。
-- **流式 scratch 占盘**：`stream_teacher.py` 跑 3000 样本 / 2048 seq /
-  hidden 4096 时 scratch 峰值 ≈ 50GB（chunked 布局，单倍水位）；2026-05-17
-  v2 cache 改造后**没有额外 stage 目录**——cache 文件 streaming 期单调
-  上升到 ≈ 530GB（= 最终 cache 体积，每张 (sample, layer) tensor 只写一
-  次）。scratch 文件数 = `ceil(N_samples / chunk_size)`（默认
-  `chunk_size=1000` → 10000 样本约 10 个 `scratch_chunk_*.cur.safetensors`
-  文件，不再随样本数线性膨胀）。host RAM per-layer 峰值 ≈
-  `chunk_size × seq × (hidden + num_experts) × 2 bytes` ≈ 17GB
-  （chunk_size=1000），RAM 紧的可以下调 `--chunk-size`。最终 teacher
-  cache 体积与旧 `cache_teacher.py` 相同，可通过减少 `cache_layers` /
-  `max_samples` / `max_seq_len` 缩减。
-- **数据源 mirror 兼容性**：`data_sources.yaml` 里 13 个源已切到
-  `parquet_glob` 旁路。`c4_ja` 走 `multilingual/c4-ja*.json.gz`，mirror
-  同步覆盖度不确定，跑前看 parquet_glob 报的 "matched files" 计数。
-  `mmlu_aux/auxiliary_train` 的 parquet 把每行嵌进顶层 `train` struct
-  （`{"train": {question, choices, answer, subject}}`），与 `all` config
-  的 flat 行不同；`mmlu_mc` transform 入口已自动 unwrap，两种 layout 共用
-  同一条 transform，详见 [memory/2026-05-17.md](memory/2026-05-17.md) §7。
-- **bitsandbytes Windows**：4bit 加载 + AdamW8bit 在 Windows 上偶发，
-  layerwise 自动 fallback 到 fp32 AdamW（多耗 ~2× 显存），train.py 4bit
-  仍建议 Linux/WSL2。
-- **transformers 版本**：`stream_teacher.py` / `train_layerwise.py` 需要
-  `qwen3_5_moe` 模型，对应 `transformers>=5.x`。`cache_teacher.py` 路径同样依赖。
