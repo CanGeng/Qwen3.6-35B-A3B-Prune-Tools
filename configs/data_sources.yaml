@@ -1,0 +1,350 @@
+# Data sources for train.jsonl synthesis.
+#
+# Quota is in TOKENS (sum of input_ids over accepted samples), not row count.
+# Total budget targets ~200M tokens; teacher-cache disk @ ~1.5KB/token = ~300GB.
+#
+# Sources are streamed lazily and stop as soon as their token quota is met.
+#
+# `extra.loader: parquet_glob` bypasses the datasets auto-resolver — required
+# for repos where the script/YAML resolver mis-targets endpoints under
+# hf-mirror (e.g. fineweb-edu's script probes /resolve/sample/10BT/ which
+# 404s, or where the auto-resolver returns an empty iterator silently).
+# We list files via the tree API and feed mirror URLs straight to the
+# parquet/json loader.
+
+builder:
+  output_jsonl: ./data/train.jsonl
+  output_image_dir: ./data/images
+  hf_endpoint: https://hf-mirror.com
+  tokenizer_path: ./models/teacher
+  max_tokens: 4096              # hard upper cap per sample
+  bucket_edges: [1, 512, 1024, 2048, 4096]
+  bucket_balance: false          # soft preference, not a hard cap
+  dedup_prefix_chars: 1024
+  shuffle_seed: 1919810
+  hf_token: HF_TOKEN HERE        # gated repos (xlam_function_calling,
+                                # the_stack_smol) need this; loader reads
+                                # from env HF_TOKEN automatically. If unset,
+                                # those two sources will 401 at fetch time
+                                # but other sources are unaffected.
+
+sources:
+  # ============= AGENT / TOOL CALL / CODE (high-priority) =============
+  # These four sources target the structured-output bottleneck post-pruning
+  # (JSON syntax, function-call format, code stability). Adding them does not
+  # remove or rescale any existing source.
+  - name: glaive_function_calling
+    type: chat
+    hf_dataset: glaiveai/glaive-function-calling-v2
+    split: train
+    transform: glaive_chat
+    quota: 10_000_000
+    extra:
+      loader: parquet_glob
+      format: json
+      subdir: ""
+      glob: "glaive-function-calling-v2.json"
+
+  - name: xlam_function_calling
+    type: chat
+    hf_dataset: Salesforce/xlam-function-calling-60k
+    split: train
+    transform: xlam_function_call
+    quota: 10_000_000
+    extra:
+      loader: parquet_glob
+      format: json
+      subdir: ""
+      glob: "xlam_function_calling_60k.json"
+      requires_token: true        # gated; loader will warn if HF_TOKEN unset
+
+  - name: magicoder_evol_instruct
+    type: chat
+    hf_dataset: ise-uiuc/Magicoder-Evol-Instruct-110K
+    split: train
+    transform: instruction_io
+    quota: 10_000_000
+    extra:
+      loader: parquet_glob
+      format: json
+      subdir: ""
+      glob: "data-evol_instruct-decontaminated.jsonl"
+
+  - name: the_stack_smol
+    type: text
+    hf_dataset: bigcode/the-stack-smol
+    split: train
+    transform: plain_text
+    quota: 10_000_000
+    extra:
+      loader: parquet_glob
+      format: json
+      subdir: data
+      globs:
+        - "python/data.json"
+        - "javascript/data.json"
+        - "typescript/data.json"
+        - "shell/data.json"
+        - "markdown/data.json"
+        - "dockerfile/data.json"
+        - "sql/data.json"
+        - "assembly/data.json"
+        - "batchfile/data.json"
+        - "c++/data.json"
+        - "c-sharp/data.json"
+        - "c/data.json"
+        - "cmake/data.json"
+        - "css/data.json"
+        - "fortran/data.json"
+        - "go/data.json"
+        - "haskell/data.json"
+        - "html/data.json"
+        - "java/data.json"
+        - "javascript/data.json"
+        - "julia/data.json"
+        - "lua/data.json"
+        - "makefile/data.json"
+        - "perl/data.json"
+        - "php/data.json"
+        - "ruby/data.json"
+        - "rust/data.json"
+        - "scala/data.json"
+        - "tex/data.json"
+        - "visual-basic/data.json"
+      text_field: content
+      requires_token: true        # gated; loader will warn if HF_TOKEN unset
+
+  # ============= MULTILINGUAL TEXT (~90M tokens) =============
+  - name: fineweb_edu_en
+    type: text
+    hf_dataset: HuggingFaceFW/fineweb-edu
+    split: train
+    transform: plain_text
+    quota: 10_000_000
+    extra:
+      loader: parquet_glob
+      subdir: sample/10BT
+      glob: "*.parquet"
+
+  - name: fineweb_edu_zh
+    type: text
+    hf_dataset: opencsg/Fineweb-Edu-Chinese-V2.1
+    split: train
+    transform: plain_text
+    quota: 10_000_000
+
+  # allenai/c4 mirror only ships en.noblocklist; multilingual subset ja
+  # may or may not be synced. If parquet_glob reports "0 files matched",
+  # disable this source or swap to range3/cc100-ja.
+  - name: c4_ja
+    type: text
+    hf_dataset: allenai/c4
+    split: train
+    transform: plain_text
+    quota: 10_000_000
+    extra:
+      loader: parquet_glob
+      format: json
+      subdir: multilingual
+      glob: "c4-ja*.json.gz"
+
+  # ============= CODE / MATH (~13M tokens) =============
+  - name: code_feedback_instruct
+    type: chat
+    hf_dataset: m-a-p/CodeFeedback-Filtered-Instruction
+    split: train
+    transform: instruction_io
+    quota: 10_000_000
+
+  - name: open_web_math
+    type: text
+    hf_dataset: open-web-math/open-web-math
+    split: train
+    transform: plain_text
+    quota: 10_000_000
+
+  # ============= GENERAL SFT (~35M tokens) =============
+  - name: tulu3_sft
+    type: chat
+    hf_dataset: allenai/tulu-3-sft-mixture
+    split: train
+    transform: messages_passthrough
+    quota: 10_000_000
+    extra:
+      loader: parquet_glob
+      subdir: data
+      glob: "train-*.parquet"
+
+  - name: smoltalk
+    type: chat
+    hf_dataset: HuggingFaceTB/smoltalk
+    split: train
+    transform: messages_passthrough
+    quota: 10_000_000
+    extra:
+      loader: parquet_glob
+      subdir: data/all
+      glob: "train-*.parquet"
+
+  - name: belle_3p5m_cn
+    type: chat
+    hf_dataset: BelleGroup/train_3.5M_CN
+    split: train
+    transform: conversations_sharegpt
+    quota: 5_000_000
+
+  - name: sharegpt_zh_en
+    type: chat
+    hf_dataset: shareAI/ShareGPT-Chinese-English-90k
+    split: train
+    transform: conversations_humanassistant
+    quota: 5_000_000
+    extra:
+      loader: parquet_glob
+      format: json
+      subdir: sharegpt_jsonl
+      glob: "common_*.jsonl"
+
+  - name: oasst_ja
+    type: chat
+    hf_dataset: llm-jp/oasst1-21k-ja
+    split: train
+    transform: conversations_sharegpt
+    quota: 5_000_000
+
+  - name: dolly_ja
+    type: chat
+    hf_dataset: kunishou/databricks-dolly-15k-ja
+    split: train
+    transform: instruction_io
+    quota: 5_000_000
+
+  # ============= DISTILLATION-STYLE CHAT (~25M tokens) =============
+  # Single ~6GB JSON file. First run downloads & caches in
+  # ~/.cache/huggingface; subsequent smoke/full builds reuse it. If smoke
+  # still feels slow, run `python -m scripts.prefetch_datasets
+  # --only openhermes_2p5` once before iterating on builder logic.
+  - name: openhermes_2p5
+    type: chat
+    hf_dataset: teknium/OpenHermes-2.5
+    split: train
+    transform: conversations_sharegpt
+    quota: 10_000_000
+
+  - name: ultrachat_200k
+    type: chat
+    hf_dataset: HuggingFaceH4/ultrachat_200k
+    split: train
+    transform: messages_passthrough
+    quota: 10_000_000
+    extra:
+      loader: parquet_glob
+      subdir: data
+      glob: "train_sft-*.parquet"
+
+  # ============= RECOVERY-STYLE SFT (~5M tokens) =============
+  # no_robots ships both raw `train-*.parquet` (instruction/response) and
+  # `train_sft-*.parquet` (chat-style messages); we need the SFT one for
+  # messages_passthrough.
+  - name: no_robots
+    type: chat
+    hf_dataset: HuggingFaceH4/no_robots
+    split: train
+    transform: messages_passthrough
+    quota: 10_000_000
+    extra:
+      loader: parquet_glob
+      subdir: data
+      glob: "train_sft-*.parquet"
+
+  - name: dolly_15k
+    type: chat
+    hf_dataset: databricks/databricks-dolly-15k
+    split: train
+    transform: instruction_io
+    quota: 10_000_000
+
+  # ============= BENCHMARK-STYLE (~12M tokens) =============
+  # Teach the model to recognize standard MC / chain-of-thought formats.
+  # mmlu_aux: auxiliary_train is a separate top-level dir in cais/mmlu.
+  # Schema may differ from the "all" config rows — verify with a probe row
+  # if mmlu_mc transform rejects everything.
+  - name: mmlu_aux
+    type: chat
+    hf_dataset: cais/mmlu
+    split: train
+    transform: mmlu_mc
+    quota: 10_000_000
+    extra:
+      loader: parquet_glob
+      subdir: auxiliary_train
+      glob: "*.parquet"
+
+  - name: gsm8k
+    type: chat
+    hf_dataset: openai/gsm8k
+    split: train
+    transform: instruction_io
+    quota: 5_000_000
+    extra:
+      loader: parquet_glob
+      subdir: main
+      glob: "train-*.parquet"
+
+  - name: hellaswag
+    type: chat
+    hf_dataset: Rowan/hellaswag
+    split: train
+    transform: hellaswag_mc
+    quota: 5_000_000
+    extra:
+      loader: parquet_glob
+      subdir: data
+      glob: "train-*.parquet"
+
+  # ============= VISION-LANGUAGE (~20M tokens) =============
+  # the_cauldron has one top-level subdir per config; subdir matches
+  # the desired split target.
+  - name: the_cauldron_ai2d
+    type: vl
+    hf_dataset: HuggingFaceM4/the_cauldron
+    split: train
+    transform: the_cauldron
+    quota: 100_000
+    extra:
+      loader: parquet_glob
+      subdir: ai2d
+      glob: "train-*.parquet"
+
+  - name: the_cauldron_chartqa
+    type: vl
+    hf_dataset: HuggingFaceM4/the_cauldron
+    split: train
+    transform: the_cauldron
+    quota: 100_000
+    extra:
+      loader: parquet_glob
+      subdir: chartqa
+      glob: "train-*.parquet"
+
+  - name: the_cauldron_docvqa
+    type: vl
+    hf_dataset: HuggingFaceM4/the_cauldron
+    split: train
+    transform: the_cauldron
+    quota: 100_000
+    extra:
+      loader: parquet_glob
+      subdir: docvqa
+      glob: "train-*.parquet"
+
+  - name: the_cauldron_ocrvqa
+    type: vl
+    hf_dataset: HuggingFaceM4/the_cauldron
+    split: train
+    transform: the_cauldron
+    quota: 100_000
+    extra:
+      loader: parquet_glob
+      subdir: ocrvqa
+      glob: "train-*.parquet"

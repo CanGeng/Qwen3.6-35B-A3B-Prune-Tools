@@ -1,0 +1,12 @@
+.claude
+.venv
+cache
+configs/data_sources.yaml.bak
+configs/example.yaml.bak
+/data/
+/memory/
+/models/
+/outputs/
+/third_party/
+/DESIGN.md
+/pretty_metrics_log.patch

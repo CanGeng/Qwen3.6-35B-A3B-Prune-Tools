@@ -1,0 +1,49 @@
+Metadata-Version: 2.4
+Name: moe-prune-distill
+Version: 0.1.0
+Summary: MoE prune and distill CLI (P0 MVP)
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: torch>=2.1.0
+Requires-Dist: transformers>=4.40.0
+Requires-Dist: safetensors>=0.4.0
+Requires-Dist: huggingface-hub>=0.20.0
+Requires-Dist: peft>=0.10.0
+Requires-Dist: bitsandbytes>=0.43.0
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: tqdm
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0; extra == "dev"
+
+# P0 快速开始
+
+在仓库根目录安装依赖（**Linux / WSL2 推荐**：Windows 上 `bitsandbytes` 可能不可用）：
+
+```bash
+pip install -r requirements.txt
+pip install -e .
+```
+
+准备 `configs/example.yaml` 中的路径，并准备 `data/train.jsonl`（每行一个 JSON，字段见 [DESIGN.md](DESIGN.md) §6.1）。
+
+## 命令顺序（P0）
+
+```bash
+python -m scripts.download --config configs/example.yaml
+python -m scripts.inspect --config configs/example.yaml
+python -m scripts.prune --config configs/example.yaml
+python -m scripts.train --config configs/example.yaml
+```
+
+说明：
+
+- **download**：设置 `HF_ENDPOINT`（若配置了 `hf_endpoint`）并 `snapshot_download` 到 `download.local_dir`。
+- **inspect**：读取教师 `config.json`，打印 adapter 解析信息与参数量粗估。
+- **prune**：仅支持 `prune.expert_selection: first_n`；输出到 `prune.student_dir`（新权重 + `config.json` + `expert_mapping.json` + tokenizer 相关文件）。
+- **train**：对剪枝后的学生模型做 **4bit + LoRA 纯 SFT**（不使用 teacher cache / 蒸馏损失）。
+
+## 单元测试
+
+```bash
+pytest -q
+```

@@ -1,0 +1,1704 @@
+"""Build a per-layer expert merge plan for ``scripts/prune_merge.py``.
+
+Given the per-layer surviving / dropped expert ids resolved by
+``_resolve_surviving`` (the same selector ``scripts/prune.py`` uses), this
+module walks the teacher shards once, computes a per-layer
+``[len(dropped), len(surviving)]`` row-stochastic weight matrix, and packs
+it into a :class:`~moe_prune_distill.prune.slicer.MergePlan` that the
+existing streaming slicer can consume in a single pass.
+
+Strategies fall into two families:
+
+* **Macro** — full-tensor mixing of dropped into kept (one row-stochastic
+  ``[Nd, Nk]`` per layer). All three of ``weight_cosine``,
+  ``weight_cosine_of_router``, and ``cooccur`` live here.
+* **Neuron-level (SwiGLU-aware)** — ``neuron_swiglu_local`` and
+  ``neuron_swiglu_global`` keep the kept expert's ``gate_up_proj``
+  untouched (preserving the SwiGLU activation boundary) and only fold the
+  dropped expert's ``down_proj`` columns into matched kept neurons. See
+  ``build_neuron_merge_plan``.
+
+Macro strategies:
+
+* **weight_cosine** — flatten each expert's ``gate_up_proj`` +
+  ``down_proj`` into a single vector, L2-normalize, compute pairwise cosine
+  similarity ``sim[d, k]``, then ``w[d, k] = softmax(sim[d, k] / tau)``
+  over k. Captures full functional similarity at the cost of loading every
+  expert's full weight stack.
+* **weight_cosine_of_router** — use each expert's row of the router gate
+  matrix (``mlp.gate.weight``) as its feature vector. Cheap to compute
+  (one ``[num_experts, hidden]`` tensor per layer, two orders of magnitude
+  smaller than the expert stack) and reflects how the *teacher* itself
+  decides expert similarity at the routing layer. Same softmax
+  normalization as ``weight_cosine``.
+* **cooccur** — read pair frequencies produced by a (future) router
+  co-occurrence collector. v1 ships a stub for the collector, so this path
+  is selectable but errors out clearly until that script is implemented.
+
+Memory budget per layer (macro):
+
+* ``weight_cosine``: ``2 × num_experts × per_expert_bytes`` in fp32
+  (load both proj stacks together to build features). For Qwen3.5 256
+  experts × ~7M params/expert × 4 bytes ≈ ~7 GB peak.
+* ``weight_cosine_of_router``: ``num_experts × hidden × 4 bytes`` in fp32
+  (~4 MB at 256 × 4096). Negligible.
+* ``cooccur``: ``num_experts^2 × 4 bytes`` (~250 KB at 256 experts). Negligible.
+
+The resulting ``MergePlan`` is also serialised to ``merge_plan.json``
+under the student dir so a downstream reader can audit which dropped
+expert went where (per-layer ``[d_id, k_id, weight]`` triples for macro,
+aggregate stats for neuron mode).
+"""
+
+from __future__ import annotations
+
+import gc
+import json
+import logging
+import math
+from collections import defaultdict
+from pathlib import Path
+from typing import Any
+
+import torch
+from safetensors import safe_open
+
+from moe_prune_distill.adapters.base import MoEAdapter
+from moe_prune_distill.prune.slicer import MergePlan
+
+
+_GATE_UP_TAIL = ".mlp.experts.gate_up_proj"
+_DOWN_TAIL = ".mlp.experts.down_proj"
+_ROUTER_TAIL = ".mlp.gate.weight"
+
+# Legacy (per-expert) Qwen2 schema fallback. v1 only fully wires up the
+# stacked-tensor case (Qwen3.5); for legacy models we'd need to load each
+# expert tensor separately. The merge_plan still works in principle; we
+# just haven't tested it on a per-expert teacher.
+
+def _log_process_mem(tag: str, log=None):
+    import os
+    import psutil
+    import gc
+
+    gc.collect()
+    p = psutil.Process(os.getpid())
+    mi = p.memory_info()
+
+    # rss: 当前进程工作集
+    # vms: 虚拟地址空间，不一定是真实占用
+    msg = (
+        f"[MEM] {tag}: "
+        f"rss={mi.rss / 1024**3:.2f} GB, "
+        f"vms={mi.vms / 1024**3:.2f} GB"
+    )
+
+    try:
+        full = p.memory_full_info()
+        if hasattr(full, "uss"):
+            msg += f", uss={full.uss / 1024**3:.2f} GB"
+        if hasattr(full, "private"):
+            msg += f", private={full.private / 1024**3:.2f} GB"
+    except Exception:
+        pass
+
+    if log:
+        log.info(msg)
+    else:
+        print(msg)
+
+
+def _build_weight_map(teacher_dir: Path) -> dict[str, str]:
+    """Subset of slicer._build_weight_map (avoid circular dep on internals)."""
+    idx = teacher_dir / "model.safetensors.index.json"
+    if idx.is_file():
+        return dict(json.loads(idx.read_text(encoding="utf-8"))["weight_map"])
+    files = sorted(p for p in teacher_dir.glob("*.safetensors") if p.is_file())
+    if not files:
+        raise FileNotFoundError(f"no safetensors under {teacher_dir}")
+    if len(files) == 1:
+        with safe_open(str(files[0]), framework="pt", device="cpu") as f:
+            keys = list(f.keys())
+        return {k: files[0].name for k in keys}
+    out: dict[str, str] = {}
+    for p in files:
+        with safe_open(str(p), framework="pt", device="cpu") as f:
+            for k in f.keys():
+                out[k] = p.name
+    return out
+
+
+def _layer_expert_keys(
+    weight_map: dict[str, str], num_layers: int
+) -> dict[int, dict[str, str]]:
+    """Group routed_expert_stack keys by layer.
+
+    Returns ``{layer: {"gate_up_proj": key, "down_proj": key}}`` for layers
+    whose teacher uses the stacked schema (Qwen3.5). Layers absent from the
+    return value have a per-expert schema and the caller must skip them
+    (with a warning).
+    """
+    out: dict[int, dict[str, str]] = defaultdict(dict)
+    for key in weight_map:
+        for tail, name in ((_GATE_UP_TAIL, "gate_up_proj"), (_DOWN_TAIL, "down_proj")):
+            if not key.endswith(tail):
+                continue
+            # ".../layers.{i}{tail}" — pull out i
+            stem = key[: -len(tail)]
+            try:
+                layer = int(stem.rsplit(".", 1)[-1])
+            except ValueError:
+                continue
+            out[layer][name] = key
+    return {l: out[l] for l in range(num_layers) if "gate_up_proj" in out[l] and "down_proj" in out[l]}
+
+
+def _layer_router_keys(
+    weight_map: dict[str, str], num_layers: int
+) -> dict[int, str]:
+    """Locate the router gate weight key for each layer.
+
+    Matches both the Qwen3.5 multimodal layout
+    (``model.language_model.layers.{i}.mlp.gate.weight``) and the legacy
+    Qwen2 layout (``model.layers.{i}.mlp.gate.weight``).
+    """
+    out: dict[int, str] = {}
+    for key in weight_map:
+        if not key.endswith(_ROUTER_TAIL):
+            continue
+        # ".../layers.{i}.mlp.gate.weight" — segment 2 from the right is the
+        # layer idx (segments [..., "layers", "{i}", "mlp", "gate", "weight"]).
+        parts = key.split(".")
+        try:
+            i = parts.index("layers")
+            layer = int(parts[i + 1])
+        except (ValueError, IndexError):
+            continue
+        out[layer] = key
+    return {l: out[l] for l in range(num_layers) if l in out}
+
+
+def _load_layer_expert_stack(
+    teacher_dir: Path,
+    weight_map: dict[str, str],
+    layer_keys: dict[str, str],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Read both expert stacks for one layer in fp32. Returns ``(gate_up, down)``."""
+    out: dict[str, torch.Tensor] = {}
+    for which, key in layer_keys.items():
+        shard = weight_map[key]
+        with safe_open(str(teacher_dir / shard), framework="pt", device="cpu") as f:
+            out[which] = f.get_tensor(key).to(torch.float32)
+    return out["gate_up_proj"], out["down_proj"]
+
+
+def _load_layer_router(
+    teacher_dir: Path,
+    weight_map: dict[str, str],
+    router_key: str,
+) -> torch.Tensor:
+    """Read one layer's router gate weight in fp32. Returns ``[num_experts, hidden]``."""
+    shard = weight_map[router_key]
+    with safe_open(str(teacher_dir / shard), framework="pt", device="cpu") as f:
+        return f.get_tensor(router_key).to(torch.float32)
+
+
+def _flatten_features(
+    gate_up: torch.Tensor, down: torch.Tensor
+) -> torch.Tensor:
+    """Build per-expert feature matrix ``[N, D]`` for cosine similarity.
+
+    ``gate_up: [N, ...]`` and ``down: [N, ...]`` are concatenated along the
+    feature axis after flattening per-expert.
+    """
+    n = gate_up.shape[0]
+    assert down.shape[0] == n, (
+        f"expert count mismatch: gate_up={gate_up.shape[0]} down={down.shape[0]}"
+    )
+    a = gate_up.reshape(n, -1)
+    b = down.reshape(n, -1)
+    return torch.cat([a, b], dim=1)
+
+
+def _weight_cosine_similarity(
+    feat: torch.Tensor, dropped: list[int], surviving: list[int]
+) -> torch.Tensor:
+    """Cosine similarity ``[len(dropped), len(surviving)]`` from a per-expert feature matrix.
+
+    Robust to zero-norm rows (dead experts after pruning): a zero feature
+    vector yields a zero similarity row, which after softmax becomes a
+    uniform distribution over surviving experts.
+    """
+    norms = feat.norm(dim=1, keepdim=True).clamp_min(1e-12)
+    feat_n = feat / norms
+    fd = feat_n[dropped]                # [Nd, D]
+    fk = feat_n[surviving]              # [Nk, D]
+    return fd @ fk.t()                  # [Nd, Nk]
+
+
+def _softmax_rows(sim: torch.Tensor, tau: float) -> torch.Tensor:
+    if sim.numel() == 0:
+        return sim
+    return torch.softmax(sim / max(tau, 1e-6), dim=1)
+
+
+def _normalize_cooccur_rows(cooccur: torch.Tensor) -> torch.Tensor:
+    """Row-normalize, with uniform fallback for any all-zero row."""
+    row_sum = cooccur.sum(dim=1, keepdim=True)
+    safe = row_sum.clamp_min(1e-12)
+    out = cooccur / safe
+    if (row_sum == 0).any():
+        nk = cooccur.shape[1]
+        zero_rows = (row_sum.squeeze(-1) == 0)
+        out[zero_rows] = 1.0 / max(nk, 1)
+    return out
+
+
+def build_merge_plan(
+    teacher_dir: str | Path,
+    adapter: MoEAdapter,
+    hf_config: dict[str, Any],
+    surviving_per_layer: dict[int, list[int]],
+    *,
+    strategy: str = "weight_cosine",
+    alpha: float = 0.5,
+    tau: float = 0.1,
+    cooccur_path: str | Path | None = None,
+    log: logging.Logger | None = None,
+) -> MergePlan:
+    """Compute a per-layer dropped→surviving expert weight matrix.
+
+    See module docstring for strategy semantics. Layers using the legacy
+    per-expert (non-stacked) schema are skipped with a warning — the
+    resulting plan still merges the stacked-schema layers and falls back
+    to plain index-select for the rest (slicer behavior with no plan).
+    """
+    log = log or logging.getLogger("moe_prune_distill.expert_merge")
+    teacher_dir = Path(teacher_dir)
+    num_layers = adapter.get_num_layers(hf_config)
+    num_experts = adapter.get_num_experts(hf_config)
+
+    weight_map = _build_weight_map(teacher_dir)
+    per_layer_expert_keys = _layer_expert_keys(weight_map, num_layers)
+    per_layer_router_keys = _layer_router_keys(weight_map, num_layers)
+
+    cooccur_data: dict[str, Any] | None = None
+    if strategy == "cooccur":
+        if cooccur_path is None or not Path(cooccur_path).is_file():
+            raise FileNotFoundError(
+                f"strategy=cooccur needs router_cooccur.json; pass --cooccur-path "
+                f"and run scripts/collect_router_cooccur.py first ({cooccur_path!r})"
+            )
+        cooccur_data = json.loads(Path(cooccur_path).read_text(encoding="utf-8"))
+    elif strategy not in ("weight_cosine", "weight_cosine_of_router"):
+        raise ValueError(f"unknown merge strategy: {strategy!r}")
+
+    plan = MergePlan(alpha=float(alpha))
+    plan.surviving_per_layer = {l: list(v) for l, v in surviving_per_layer.items()}
+    plan.dropped_per_layer = {
+        l: [e for e in range(num_experts) if e not in set(surviving_per_layer.get(l, []))]
+        for l in range(num_layers)
+    }
+
+    skipped: list[tuple[int, str]] = []
+    for layer in range(num_layers):
+        surviving = list(surviving_per_layer.get(layer, []))
+        dropped = plan.dropped_per_layer[layer]
+        if not surviving or not dropped:
+            continue
+
+        if strategy == "weight_cosine":
+            if layer not in per_layer_expert_keys:
+                skipped.append((layer, "no stacked expert keys"))
+                continue
+            gate_up, down = _load_layer_expert_stack(
+                teacher_dir, weight_map, per_layer_expert_keys[layer]
+            )
+            feat = _flatten_features(gate_up, down)
+            del gate_up, down
+            sim = _weight_cosine_similarity(feat, dropped, surviving)
+            del feat
+            w = _softmax_rows(sim, tau)
+        elif strategy == "weight_cosine_of_router":
+            if layer not in per_layer_router_keys:
+                skipped.append((layer, "no router gate key"))
+                continue
+            router_w = _load_layer_router(
+                teacher_dir, weight_map, per_layer_router_keys[layer]
+            )
+            if router_w.ndim != 2 or router_w.shape[0] != num_experts:
+                # Router has already been sliced (rows != num_experts) or is
+                # the wrong rank — bail rather than silently misalign.
+                skipped.append(
+                    (layer, f"router shape {tuple(router_w.shape)} ≠ ({num_experts}, hidden)")
+                )
+                continue
+            sim = _weight_cosine_similarity(router_w, dropped, surviving)
+            del router_w
+            w = _softmax_rows(sim, tau)
+        else:  # cooccur
+            assert cooccur_data is not None
+            layer_pair = cooccur_data.get("layers", {}).get(str(layer), {})
+            pair = layer_pair.get("pair_counts")
+            if pair is None:
+                raise ValueError(
+                    f"router_cooccur.json missing pair_counts for layer {layer}"
+                )
+            mat = torch.zeros(num_experts, num_experts, dtype=torch.float32)
+            for d_str, kvs in pair.items():
+                d = int(d_str)
+                for k_str, c in kvs.items():
+                    mat[d, int(k_str)] = float(c)
+            sub = mat[dropped][:, surviving]
+            w = _normalize_cooccur_rows(sub)
+        plan.weights[layer] = w.to(torch.float32).contiguous()
+
+    if skipped:
+        preview = [f"{l}({why})" for l, why in skipped[:8]]
+        if len(skipped) > 8:
+            preview.append("...")
+        log.warning(
+            "merge_plan: %d layer(s) skipped (fall back to index-select-only, no merge): %s",
+            len(skipped),
+            preview,
+        )
+
+    return plan
+
+
+def serialize_merge_plan(plan: MergePlan) -> dict[str, Any]:
+    """Convert a ``MergePlan`` to a json-serialisable dict.
+
+    Schema branches on ``plan.mode``:
+
+    * ``"macro"`` (default): per-layer entry lists ``[dropped_id, kept_id,
+      weight]`` triples (legacy auditable format).
+    * ``"neuron_swiglu"``: per-layer aggregate stats (hosted, dropped<thr,
+      sim quantiles, host-load histogram, optional D->K(D) host pairs).
+      The full ``[Nd*I, Nk*I]`` assignment is **not** serialised — at
+      Qwen3.5 scale that would be >100 MB. Use
+      ``--write-neuron-audit`` (CLI) to write a separate ``.npz`` if a
+      full audit is needed.
+    """
+    if plan.mode == "neuron_swiglu":
+        return _serialize_neuron_plan(plan)
+
+    out: dict[str, Any] = {
+        "mode": "macro",
+        "alpha": float(plan.alpha),
+        "layers": {},
+    }
+    for layer, w in plan.weights.items():
+        dropped = plan.dropped_per_layer.get(layer, [])
+        surviving = plan.surviving_per_layer.get(layer, [])
+        triples: list[list[float]] = []
+        wt = w.to(torch.float32)
+        for di, d_id in enumerate(dropped):
+            for ki, k_id in enumerate(surviving):
+                triples.append([int(d_id), int(k_id), float(wt[di, ki])])
+        out["layers"][str(layer)] = {
+            "dropped": list(map(int, dropped)),
+            "surviving": list(map(int, surviving)),
+            "weights": triples,
+        }
+    return out
+
+
+def _serialize_neuron_plan(plan: MergePlan) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "mode": "neuron_swiglu",
+        "strategy": plan.neuron_meta.get("strategy"),
+        "alpha": float(plan.alpha),
+        "sim_threshold": plan.neuron_meta.get("sim_threshold"),
+        "top_k": plan.neuron_meta.get("top_k"),
+        "router_stats_used": bool(plan.neuron_meta.get("router_stats_used", False)),
+        "layers": {},
+    }
+    for layer in sorted(plan.neuron_stats.keys()):
+        s = plan.neuron_stats[layer]
+        layer_out = {
+            "surviving": list(map(int, plan.surviving_per_layer.get(layer, []))),
+            "dropped": list(map(int, plan.dropped_per_layer.get(layer, []))),
+            "neuron_stats": {
+                k: v
+                for k, v in s.items()
+                if k not in ("host_pairs",)  # host_pairs goes one level up
+            },
+        }
+        if "host_pairs" in s:
+            layer_out["host_pairs"] = {str(k): int(v) for k, v in s["host_pairs"].items()}
+        out["layers"][str(layer)] = layer_out
+    return out
+
+
+def write_merge_report(
+    plan: MergePlan,
+    student_dir: str | Path,
+    *,
+    teacher_arch: str | None = None,
+    num_layers_total: int | None = None,
+    num_experts_total: int | None = None,
+    target_num_experts: int | None = None,
+    target_num_experts_per_tok: int | None = None,
+) -> Path:
+    """Write a human-readable ``merge_report.md`` next to ``merge_plan.json``.
+
+    Returns the report path. Safe to call for both macro and neuron modes;
+    macro mode prints a compact section without the neuron tables.
+    """
+    student_dir = Path(student_dir)
+    student_dir.mkdir(parents=True, exist_ok=True)
+    out_path = student_dir / "merge_report.md"
+
+    lines: list[str] = ["# Expert Merge Report", ""]
+    if plan.mode == "neuron_swiglu":
+        lines += [
+            f"- Strategy: `{plan.neuron_meta.get('strategy')}`",
+        ]
+    else:
+        lines += [
+            "- Strategy: `macro` (legacy weighted scaled-add)",
+        ]
+    if teacher_arch:
+        teacher_line = f"- Teacher: `{teacher_arch}`"
+        if num_layers_total is not None and num_experts_total is not None:
+            teacher_line += f" ({num_layers_total} layers, {num_experts_total} experts)"
+        lines.append(teacher_line)
+    if target_num_experts is not None:
+        st = f"- Student: {target_num_experts} experts"
+        if target_num_experts_per_tok is not None:
+            st += f" (per-token = {target_num_experts_per_tok})"
+        lines.append(st)
+    lines += [
+        f"- Alpha: {plan.alpha}",
+    ]
+    if plan.mode == "neuron_swiglu":
+        lines += [
+            f"- Sim threshold: {plan.neuron_meta.get('sim_threshold')}",
+            f"- Top-K (global only): {plan.neuron_meta.get('top_k')}",
+            f"- Router-stats dynamic alpha: "
+            f"{'enabled' if plan.neuron_meta.get('router_stats_used') else 'disabled'}",
+        ]
+    lines.append("")
+
+    if plan.mode == "neuron_swiglu" and plan.neuron_stats:
+        total_dropped = sum(s["total_dropped_neurons"] for s in plan.neuron_stats.values())
+        total_hosted = sum(s["hosted"] for s in plan.neuron_stats.values())
+        total_drop_thr = sum(s["dropped_below_thr"] for s in plan.neuron_stats.values())
+        weighted_sim = (
+            sum(
+                s["sim_mean_hosted"] * s["hosted"]
+                for s in plan.neuron_stats.values()
+            )
+            / total_hosted
+            if total_hosted
+            else 0.0
+        )
+        lines += [
+            "## Aggregate",
+            "",
+            "| Metric | Value |",
+            "|---|---|",
+            f"| Layers processed | {len(plan.neuron_stats)} |",
+            f"| Total dropped neurons across model | {total_dropped:,} |",
+            f"| Hosted (sim ≥ threshold) | {total_hosted:,} ({100.0*total_hosted/max(1,total_dropped):.1f}%) |",
+            f"| Dropped below threshold | {total_drop_thr:,} ({100.0*total_drop_thr/max(1,total_dropped):.1f}%) |",
+            f"| Mean cosine sim of hosted matches | {weighted_sim:.3f} |",
+            "",
+        ]
+
+        # Per-layer hosted-rate ranking.
+        per_layer = sorted(
+            plan.neuron_stats.items(),
+            key=lambda kv: kv[1]["hosted"] / max(1, kv[1]["total_dropped_neurons"]),
+            reverse=True,
+        )
+        lines += [
+            "## Per-layer summary (top 5 highest hosted-rate)",
+            "",
+            "| Layer | Hosted | Dropped<thr | Hosted-rate | Mean sim | Host-load max |",
+            "|---|---|---|---|---|---|",
+        ]
+        for layer, s in per_layer[:5]:
+            rate = 100.0 * s["hosted"] / max(1, s["total_dropped_neurons"])
+            lines.append(
+                f"| {layer} | {s['hosted']:,} | {s['dropped_below_thr']:,} "
+                f"| {rate:.1f}% | {s['sim_mean_hosted']:.3f} | {s['host_load_max']} |"
+            )
+        lines.append("")
+
+        lines += [
+            "## Per-layer summary (top 5 lowest hosted-rate — investigate)",
+            "",
+            "| Layer | Hosted | Dropped<thr | Hosted-rate | Mean sim | Host-load max |",
+            "|---|---|---|---|---|---|",
+        ]
+        for layer, s in per_layer[-5:][::-1]:
+            rate = 100.0 * s["hosted"] / max(1, s["total_dropped_neurons"])
+            lines.append(
+                f"| {layer} | {s['hosted']:,} | {s['dropped_below_thr']:,} "
+                f"| {rate:.1f}% | {s['sim_mean_hosted']:.3f} | {s['host_load_max']} |"
+            )
+        lines.append("")
+
+        # Network-wide host load.
+        max_load = max(s["host_load_max"] for s in plan.neuron_stats.values())
+        all_hist: dict[str, int] = {"0": 0, "1": 0, "2": 0, "3": 0, ">=4": 0}
+        for s in plan.neuron_stats.values():
+            for bk, bv in s.get("host_load_histogram", {}).items():
+                all_hist[bk] = all_hist.get(bk, 0) + int(bv)
+        total_hist = sum(all_hist.values()) or 1
+        lines += [
+            "## Host load distribution (network-wide)",
+            "",
+            f"- Max dropped-neurons absorbed by a single host: **{max_load}**",
+            f"- Hosts with 0 absorbed: {all_hist['0']:,} ({100.0*all_hist['0']/total_hist:.1f}%)",
+            f"- Hosts with 1: {all_hist['1']:,} ({100.0*all_hist['1']/total_hist:.1f}%)",
+            f"- Hosts with 2: {all_hist['2']:,}",
+            f"- Hosts with 3: {all_hist['3']:,}",
+            f"- Hosts with ≥4: {all_hist['>=4']:,}",
+            "",
+        ]
+
+        # Actionable warnings.
+        warnings: list[str] = []
+        for layer, s in plan.neuron_stats.items():
+            rate = s["hosted"] / max(1, s["total_dropped_neurons"])
+            if rate < 0.10 and s["total_dropped_neurons"] > 0:
+                warnings.append(
+                    f"- Layer {layer}: hosted-rate {100*rate:.1f}% < 10% — "
+                    f"consider lowering --neuron-sim-threshold."
+                )
+            if s["host_load_max"] >= 32:
+                warnings.append(
+                    f"- Layer {layer}: a single host absorbed {s['host_load_max']} "
+                    f"dropped neurons — possible dead-row collision; consider raising "
+                    f"--neuron-sim-threshold."
+                )
+        if warnings:
+            lines += ["## Warnings", ""] + warnings + [""]
+        else:
+            lines += ["## Warnings", "", "_None_", ""]
+
+    elif plan.mode == "macro":
+        lines += [
+            "## Aggregate (macro)",
+            "",
+            f"- Layers covered: {len(plan.weights)}",
+            f"- Alpha: {plan.alpha}",
+            "",
+            "Per-layer triples are written to `merge_plan.json`.",
+            "",
+        ]
+
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return out_path
+
+
+__all__ = [
+    "build_merge_plan",
+    "build_neuron_merge_plan",
+    "serialize_merge_plan",
+    "write_merge_report",
+]
+
+
+# === Neuron-level (SwiGLU-aware) merge ====================================
+
+
+def _split_gate_up(gate_up: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split a ``gate_up_proj`` stack into separate gate / up tensors.
+
+    Real Qwen3.5 layout is ``[E, 2*I, H]`` (the ``2*I`` axis interleaves a
+    block of gate rows then a block of up rows; see
+    ``transformers.models.qwen3_5_moe.modeling_qwen3_5_moe`` ~line 734).
+
+    This helper accepts ``[E, 2*I, H]`` and returns ``(gate, up)`` each
+    shaped ``[E, I, H]``. If the second dim is odd, a ``ValueError`` is
+    raised — the caller should fall back to skipping the layer rather
+    than guessing.
+    """
+    if gate_up.ndim != 3:
+        raise ValueError(
+            f"gate_up_proj must be rank-3 [E, 2I, H], got shape {tuple(gate_up.shape)}"
+        )
+    e, two_i, h = gate_up.shape
+    if two_i % 2 != 0:
+        raise ValueError(
+            f"gate_up_proj middle dim must be even (2*I), got {two_i}"
+        )
+    i = two_i // 2
+    gate = gate_up[:, :i, :].contiguous()  # [E, I, H]
+    up = gate_up[:, i:, :].contiguous()    # [E, I, H]
+    return gate, up
+
+
+def _build_super_vec(
+    gate_up: torch.Tensor,
+) -> tuple[torch.Tensor, int, int]:
+    """Build per-neuron super-vectors ``[E, I, 2H]`` and L2-normalize.
+
+    Returns ``(super_norm, intermediate_size, hidden_size)``.
+
+    The super-vector for neuron ``(e, i)`` is ``[gate_row || up_row]`` of
+    shape ``[2H]`` — the SwiGLU activation boundary depends only on the
+    direction of this concatenated vector (cf. plan §design).
+    """
+    gate, up = _split_gate_up(gate_up)
+    e, i, h = gate.shape
+    super_vec = torch.cat([gate, up], dim=2)             # [E, I, 2H]
+    norms = super_vec.norm(dim=2, keepdim=True).clamp_min(1e-12)
+    return (super_vec / norms).contiguous(), i, h
+
+
+def _scatter_down_columns(
+    bucket: torch.Tensor,           # [Nk, H, I]   (mutated in-place)
+    d_down: torch.Tensor,           # [H, I]       (one dropped expert's down_proj)
+    host_kept_e: torch.Tensor,      # [Q] long, in [0, Nk)
+    host_kept_n: torch.Tensor,      # [Q] long, in [0, I)
+    src_neuron: torch.Tensor,       # [Q] long, in [0, I)
+    scale: float,
+) -> None:
+    """Add ``scale * d_down[:, src_neuron[q]]`` into ``bucket[host_kept_e[q], :, host_kept_n[q]]``.
+
+    Uses ``index_put_(accumulate=True)`` so multiple dropped neurons
+    landing on the same host slot accumulate (rather than overwriting).
+    """
+    if host_kept_e.numel() == 0:
+        return
+    # Source columns: [H, Q]
+    src = d_down.index_select(dim=1, index=src_neuron) * scale
+    # Scatter: bucket[host_kept_e, :, host_kept_n] += src.t()  (per column)
+    # index_put requires expanded indices over the H axis.
+    h = bucket.shape[1]
+    h_idx = torch.arange(h, dtype=torch.long).view(h, 1).expand(h, host_kept_e.numel())
+    e_idx = host_kept_e.view(1, -1).expand(h, host_kept_e.numel())
+    n_idx = host_kept_n.view(1, -1).expand(h, host_kept_e.numel())
+    bucket.index_put_((e_idx, h_idx, n_idx), src, accumulate=True)
+
+
+def _quantile(values: torch.Tensor, q: float) -> float:
+    """Robust quantile that returns 0.0 on empty input (vs torch.quantile, which raises)."""
+    if values.numel() == 0:
+        return 0.0
+    return float(torch.quantile(values.to(torch.float32), q).item())
+
+
+def _build_host_load_histogram(
+    host_load: torch.Tensor,          # [Nk, I] int counts of dropped neurons absorbed
+) -> dict[str, int]:
+    """Bucketize host load into ``{0, 1, 2, 3, ">=4"}`` for compact reporting."""
+    flat = host_load.reshape(-1)
+    h: dict[str, int] = {"0": 0, "1": 0, "2": 0, "3": 0, ">=4": 0}
+    for v_t in flat:
+        v = int(v_t.item())
+        if v >= 4:
+            h[">=4"] += 1
+        else:
+            h[str(v)] += 1
+    return h
+
+
+def _match_local_layer(
+    super_norm: torch.Tensor,         # [E, I, 2H], L2-normalized
+    down: torch.Tensor,               # [E, H, I]
+    surviving: list[int],
+    dropped: list[int],
+    router_w: torch.Tensor,           # [E, hidden]  (full router gate weight)
+    *,
+    sim_threshold: float,
+    alpha: float,
+    expert_alpha_scale: dict[int, float] | None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Local two-stage match: pick host expert via router cosine, then match neurons inside.
+
+    Returns ``(bucket, stats)`` where:
+      * ``bucket: [Nk, H, I]`` is the down_proj contribution (already alpha-scaled).
+      * ``stats`` carries hosted / dropped-below-threshold / sim quantiles, plus
+        ``host_pairs`` = ``{dropped_id -> host_id}`` for audit.
+    """
+    nk = len(surviving)
+    h = down.shape[1]
+    i = down.shape[2]
+    bucket = torch.zeros(nk, h, i, dtype=torch.float32)
+    host_load = torch.zeros(nk, i, dtype=torch.long)
+
+    # Stage 1: router-cosine host selection (D -> K(D)).
+    rw = router_w.to(torch.float32)
+    rw_norm = rw / rw.norm(dim=1, keepdim=True).clamp_min(1e-12)
+    rw_d = rw_norm[dropped]                   # [Nd, H]
+    rw_k = rw_norm[surviving]                 # [Nk, H]
+    sim_router = rw_d @ rw_k.t()              # [Nd, Nk]
+    host_kept_idx = sim_router.argmax(dim=1)  # [Nd] in [0, Nk)
+    host_pairs: dict[int, int] = {
+        int(d): int(surviving[host_kept_idx[di].item()])
+        for di, d in enumerate(dropped)
+    }
+
+    # Stage 2: per-pair neuron-level match.
+    hosted_total = 0
+    drop_below_thr_total = 0
+    all_hosted_sims: list[torch.Tensor] = []
+
+    for d_pos, d_id in enumerate(dropped):
+        k_pos = int(host_kept_idx[d_pos].item())
+        k_id = surviving[k_pos]
+        d_super = super_norm[d_id]            # [I, 2H]
+        k_super = super_norm[k_id]            # [I, 2H]
+        sim = d_super @ k_super.t()           # [I, I]
+        best_val, best_n = sim.max(dim=1)     # [I], [I]
+        mask = best_val >= sim_threshold
+        hosted_total += int(mask.sum().item())
+        drop_below_thr_total += int((~mask).sum().item())
+
+        if mask.any():
+            keep_d_neurons = mask.nonzero(as_tuple=False).flatten()
+            best_n_kept = best_n.index_select(0, keep_d_neurons)
+            d_down_f = down[d_id].to(torch.float32)
+            scale = alpha
+            if expert_alpha_scale is not None:
+                scale *= float(expert_alpha_scale.get(int(d_id), 1.0))
+            host_e = torch.full_like(keep_d_neurons, k_pos)
+            _scatter_down_columns(
+                bucket, d_down_f, host_e, best_n_kept, keep_d_neurons, scale
+            )
+            host_load[k_pos].index_add_(
+                0, best_n_kept, torch.ones_like(best_n_kept)
+            )
+            all_hosted_sims.append(best_val.index_select(0, keep_d_neurons))
+
+    sims = (
+        torch.cat(all_hosted_sims)
+        if all_hosted_sims
+        else torch.empty(0, dtype=torch.float32)
+    )
+    stats: dict[str, Any] = {
+        "total_dropped_neurons": len(dropped) * i,
+        "hosted": hosted_total,
+        "dropped_below_thr": drop_below_thr_total,
+        "sim_mean_hosted": float(sims.mean().item()) if sims.numel() else 0.0,
+        "sim_p10_hosted": _quantile(sims, 0.10),
+        "sim_p90_hosted": _quantile(sims, 0.90),
+        "host_load_max": int(host_load.max().item()) if host_load.numel() else 0,
+        "host_load_histogram": _build_host_load_histogram(host_load),
+        "host_pairs": host_pairs,
+    }
+    return bucket, stats
+
+
+def _greedy_topk_assignment(
+    top_sim: torch.Tensor,  # [N, K] float, descending per row
+    top_idx: torch.Tensor,  # [N, K] long, candidate column ids (-1 = pad)
+    num_cols: int,
+) -> torch.Tensor:
+    """Greedy stable matching used as a scipy-free fallback for block-Hungarian.
+
+    Iterate rows in descending order of best-sim; each row claims its
+    best unclaimed candidate from its top-K. When all K candidates of a
+    row are already taken the row stays unmatched (-1). 1-to-1 quality
+    is good enough for top-K = 4..8; production users wanting a true
+    optimum should install scipy.
+    """
+    n, k = top_idx.shape
+    out = torch.full((n,), -1, dtype=torch.long)
+    if n == 0 or k == 0:
+        return out
+    claimed = torch.zeros(num_cols, dtype=torch.bool)
+    # Sort rows by their best (column-0) similarity, descending.
+    best_sim_per_row = top_sim[:, 0]
+    order = torch.argsort(best_sim_per_row, descending=True).tolist()
+    for r in order:
+        for slot in range(k):
+            cand = int(top_idx[r, slot].item())
+            if cand < 0:
+                continue
+            if not bool(claimed[cand].item()):
+                out[r] = cand
+                claimed[cand] = True
+                break
+    return out
+
+
+def _block_hungarian(
+    cost: torch.Tensor,               # [N, M] float, cost = -sim, +inf-ish for non-candidates
+    *,
+    block_threshold: int = 80_000,
+    num_blocks: int = 8,
+    top_idx: torch.Tensor | None = None,
+    top_sim: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Optimal-or-greedy assignment of dropped neurons to surviving slots.
+
+    When scipy is available, runs ``linear_sum_assignment`` (true Hungarian)
+    on the full cost matrix or per-block depending on size. When scipy is
+    not installed, falls back to a stable greedy walk over the top-K
+    candidates supplied via ``top_idx`` / ``top_sim`` (no scipy dependency,
+    O(N*K) cost). Returns ``[N]`` long tensor where index ``r`` holds the
+    matched column id (or -1 if unmatched).
+    """
+    n, m = cost.shape
+    out = torch.full((n,), -1, dtype=torch.long)
+    if n == 0 or m == 0:
+        return out
+
+    try:
+        from scipy.optimize import linear_sum_assignment  # type: ignore
+    except ImportError:
+        if top_idx is None or top_sim is None:
+            raise RuntimeError(
+                "neuron_swiglu_global needs either scipy installed or pre-computed "
+                "top_idx/top_sim for the greedy fallback"
+            )
+        return _greedy_topk_assignment(top_sim, top_idx, num_cols=m)
+
+    if n <= block_threshold:
+        cost_np = cost.detach().cpu().numpy()
+        row_ind, col_ind = linear_sum_assignment(cost_np)
+        out[torch.as_tensor(row_ind, dtype=torch.long)] = torch.as_tensor(
+            col_ind, dtype=torch.long
+        )
+        return out
+
+    rows_per = math.ceil(n / num_blocks)
+    cols_per = math.ceil(m / num_blocks)
+    for b in range(num_blocks):
+        r0, r1 = b * rows_per, min(n, (b + 1) * rows_per)
+        c0, c1 = b * cols_per, min(m, (b + 1) * cols_per)
+        if r0 >= r1 or c0 >= c1:
+            continue
+        sub = cost[r0:r1, c0:c1].detach().cpu().numpy()
+        row_ind, col_ind = linear_sum_assignment(sub)
+        out[r0 + torch.as_tensor(row_ind, dtype=torch.long)] = (
+            c0 + torch.as_tensor(col_ind, dtype=torch.long)
+        )
+    return out
+
+
+def _match_global_layer_disabled(
+    super_norm: torch.Tensor,         # [E, I, 2H]
+    down: torch.Tensor,               # [E, H, I]
+    surviving: list[int],
+    dropped: list[int],
+    *,
+    sim_threshold: float,
+    alpha: float,
+    top_k: int,
+    expert_alpha_scale: dict[int, float] | None,
+    expert_chunk: int,
+    scratch_dir: Path | None,
+    layer: int,
+    block_threshold: int,
+    hungarian_blocks: int,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Global match: every dropped neuron searches all surviving neurons in this layer.
+
+    Path: chunked matmul -> top-K candidates per dropped neuron -> assemble
+    cost matrix -> block-Hungarian -> threshold -> scatter into bucket.
+    Top-K candidates are optionally cached to ``scratch_dir`` (one ``.pt``
+    per layer) so a re-run with adjusted threshold can skip the matmul.
+    """
+    nk, nd = len(surviving), len(dropped)
+    e, i, two_h = super_norm.shape
+    h = down.shape[1]
+
+    kept_super = super_norm[surviving].reshape(nk * i, two_h).contiguous()  # [Nk*I, 2H]
+
+    nd_total = nd * i
+    top_sim = torch.full((nd_total, top_k), -1.0, dtype=torch.float32)
+    top_idx = torch.full((nd_total, top_k), -1, dtype=torch.long)
+
+    cache_path = (scratch_dir / f"neuron_match_layer{layer}.pt") if scratch_dir else None
+    cached = (
+        torch.load(cache_path, map_location="cpu", weights_only=True)
+        if cache_path is not None and cache_path.is_file()
+        else None
+    )
+    if cached is not None and cached.get("nd_total") == nd_total and cached.get("nk_total") == nk * i:
+        top_sim = cached["top_sim"]
+        top_idx = cached["top_idx"]
+    else:
+        # Stream dropped experts in chunks to bound peak memory.
+        chunk = max(1, expert_chunk)
+        for d_start in range(0, nd, chunk):
+            d_end = min(nd, d_start + chunk)
+            d_block = super_norm[[dropped[di] for di in range(d_start, d_end)]]
+            # [chunk, I, 2H] -> [chunk*I, 2H]
+            d_flat = d_block.reshape((d_end - d_start) * i, two_h).contiguous()
+            sim = d_flat @ kept_super.t()                 # [chunk*I, Nk*I]
+            # Per-row top-K (descending).
+            k_eff = min(top_k, sim.shape[1])
+            vals, idx = sim.topk(k_eff, dim=1, largest=True, sorted=True)
+            row0 = d_start * i
+            row1 = d_end * i
+            top_sim[row0:row1, :k_eff] = vals
+            top_idx[row0:row1, :k_eff] = idx
+            del sim, vals, idx, d_flat, d_block
+        if cache_path is not None:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {
+                    "nd_total": nd_total,
+                    "nk_total": nk * i,
+                    "top_sim": top_sim,
+                    "top_idx": top_idx,
+                },
+                cache_path,
+            )
+
+    # Build a sparse cost matrix using only the top-K candidates per row.
+    # cost shape: [Nd_total, Nk_total]; cells outside the top-K stay at +large.
+    nk_total = nk * i
+    LARGE = 1e6
+    cost = torch.full((nd_total, nk_total), LARGE, dtype=torch.float32)
+    rows_for_scatter = (
+        torch.arange(nd_total, dtype=torch.long).view(-1, 1).expand_as(top_idx)
+    )
+    valid_mask = top_idx >= 0
+    flat_rows = rows_for_scatter[valid_mask]
+    flat_cols = top_idx[valid_mask]
+    flat_cost = -top_sim[valid_mask]
+    cost[flat_rows, flat_cols] = flat_cost
+
+    assignment = _block_hungarian(
+        cost,
+        block_threshold=block_threshold,
+        num_blocks=hungarian_blocks,
+        top_idx=top_idx,
+        top_sim=top_sim,
+    )
+
+    # Decode assignment into (host_kept_e, host_kept_n) and threshold filter.
+    bucket = torch.zeros(nk, h, i, dtype=torch.float32)
+    host_load = torch.zeros(nk, i, dtype=torch.long)
+    hosted_total = 0
+    drop_below_thr_total = 0
+    sims_hosted: list[float] = []
+
+    for d_pos in range(nd):
+        d_id = dropped[d_pos]
+        d_down_f = down[d_id].to(torch.float32)
+        scale = alpha
+        if expert_alpha_scale is not None:
+            scale *= float(expert_alpha_scale.get(int(d_id), 1.0))
+        # Rows for this dropped expert: d_pos*I .. (d_pos+1)*I
+        row_lo = d_pos * i
+        keep_e_buf: list[int] = []
+        keep_n_buf: list[int] = []
+        src_buf: list[int] = []
+        for src_n in range(i):
+            assigned = int(assignment[row_lo + src_n].item())
+            if assigned < 0:
+                drop_below_thr_total += 1
+                continue
+            sim_value = -float(cost[row_lo + src_n, assigned].item())
+            if sim_value >= LARGE - 1.0 or sim_value < sim_threshold:
+                drop_below_thr_total += 1
+                continue
+            kept_e = assigned // i
+            kept_n = assigned % i
+            keep_e_buf.append(kept_e)
+            keep_n_buf.append(kept_n)
+            src_buf.append(src_n)
+            sims_hosted.append(sim_value)
+            host_load[kept_e, kept_n] += 1
+
+        if keep_e_buf:
+            host_e = torch.tensor(keep_e_buf, dtype=torch.long)
+            host_n = torch.tensor(keep_n_buf, dtype=torch.long)
+            src = torch.tensor(src_buf, dtype=torch.long)
+            _scatter_down_columns(bucket, d_down_f, host_e, host_n, src, scale)
+            hosted_total += len(keep_e_buf)
+
+    sims_t = (
+        torch.tensor(sims_hosted, dtype=torch.float32)
+        if sims_hosted
+        else torch.empty(0, dtype=torch.float32)
+    )
+    stats: dict[str, Any] = {
+        "total_dropped_neurons": nd_total,
+        "hosted": hosted_total,
+        "dropped_below_thr": drop_below_thr_total,
+        "sim_mean_hosted": float(sims_t.mean().item()) if sims_t.numel() else 0.0,
+        "sim_p10_hosted": _quantile(sims_t, 0.10),
+        "sim_p90_hosted": _quantile(sims_t, 0.90),
+        "host_load_max": int(host_load.max().item()) if host_load.numel() else 0,
+        "host_load_histogram": _build_host_load_histogram(host_load),
+    }
+    return bucket, stats
+
+
+def _match_global_layer_disabled_2(
+        super_norm: torch.Tensor,  # [E, I, 2H] 已经 L2 归一化的超向量
+        down: torch.Tensor,  # [E, H, I]
+        surviving: list[int],
+        dropped: list[int],
+        *,
+        sim_threshold: float,
+        alpha: float,
+        top_k: int,
+        expert_alpha_scale: dict[int, float] | None,
+        expert_chunk: int,
+        scratch_dir: Path | None,
+        layer: int,
+        block_threshold: int,  # (保留接口参数，虽然我们强制分块)
+        hungarian_blocks: int,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    import math
+    import gc
+
+    nk, nd = len(surviving), len(dropped)
+    e, i, two_h = super_norm.shape
+    h = down.shape[1]
+    kept_super = super_norm[surviving].reshape(nk * i, two_h).contiguous()  # [Nk*I, 2H]
+    nd_total = nd * i
+    nk_total = nk * i
+
+    # 只需要存放全图 top_K 的候选数据，内存消耗微乎其微 (几 MB)
+    top_sim = torch.full((nd_total, top_k), -1.0, dtype=torch.float32)
+    top_idx = torch.full((nd_total, top_k), -1, dtype=torch.long)
+    cache_path = (scratch_dir / f"neuron_match_layer{layer}.pt") if scratch_dir else None
+    cached = (
+        torch.load(cache_path, map_location="cpu", weights_only=True)
+        if cache_path is not None and cache_path.is_file()
+        else None
+    )
+    if cached is not None and cached.get("nd_total") == nd_total and cached.get("nk_total") == nk_total:
+        top_sim = cached["top_sim"]
+        top_idx = cached["top_idx"]
+    else:
+        # ==================== 第 1 重防 OOM 护城河：张量乘法分块 ====================
+        # 强制缩小 expert_chunk，防止求内积时张量爆炸 (1个专家 = 4096维度)
+        chunk = max(1, min(expert_chunk, 4))
+
+        for d_start in range(0, nd, chunk):
+            d_end = min(nd, d_start + chunk)
+            d_block = super_norm[[dropped[di] for di in range(d_start, d_end)]]
+            d_flat = d_block.reshape((d_end - d_start) * i, two_h).contiguous()
+
+            # [chunk*I, 2H] @ [2H, Nk*I] -> [chunk*I, Nk*I]
+            # 因为有了上面的强力 chunk 约束，这块临时矩阵顶多几百 MB，绝对不会爆内存
+            sim = d_flat @ kept_super.t()
+            k_eff = min(top_k, sim.shape[1])
+            vals, idx = sim.topk(k_eff, dim=1, largest=True, sorted=True)
+
+            row0 = d_start * i
+            row1 = d_end * i
+            top_sim[row0:row1, :k_eff] = vals
+            top_idx[row0:row1, :k_eff] = idx
+
+            # 极限垃圾回收
+            del sim, vals, idx, d_flat, d_block
+            gc.collect()
+        if cache_path is not None:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {"nd_total": nd_total, "nk_total": nk_total, "top_sim": top_sim, "top_idx": top_idx},
+                cache_path,
+            )
+    # ==================== 第 2 重防 OOM 护城河：无消耗动态分块匈牙利 ====================
+    # 完全废除构建 (nd_total, nk_total) 的全连接空矩阵，改为纯净的按需渲染
+    LARGE = 1e6
+    assignment = torch.full((nd_total,), -1, dtype=torch.long)
+    cost_scores = torch.full((nd_total,), -1.0, dtype=torch.float32)
+
+    # 我们仅在 SciPy 安装时尝试匈牙利算法，否则降级为普通列表遍历，系统极为安全
+    try:
+        from scipy.optimize import linear_sum_assignment
+        scipy_installed = True
+    except ImportError:
+        scipy_installed = False
+    if scipy_installed and hungarian_blocks > 0:
+        rows_per = math.ceil(nd_total / hungarian_blocks)
+        cols_per = math.ceil(nk_total / hungarian_blocks)
+        for b in range(hungarian_blocks):
+            r0, r1 = b * rows_per, min(nd_total, (b + 1) * rows_per)
+            c0, c1 = b * cols_per, min(nk_total, (b + 1) * cols_per)
+            if r0 >= r1 or c0 >= c1:
+                continue
+
+            # [核心突破]：局部构建微型对角格点阵，仅占用几 KB 到 几 MB 内存
+            sub_cost = torch.full((r1 - r0, c1 - c0), LARGE, dtype=torch.float32)
+
+            # 使用 numpy 加速数据抽取
+            np_top_idx = top_idx[r0:r1].numpy()
+            np_top_sim = top_sim[r0:r1].numpy()
+
+            for local_r in range(r1 - r0):
+                for slot in range(top_k):
+                    cand = np_top_idx[local_r, slot]
+                    if cand >= c0 and cand < c1:
+                        # 填充分块内的真实相似度 (转为代价形式)
+                        sub_cost[local_r, cand - c0] = -np_top_sim[local_r, slot]
+
+            # 微小的矩阵瞬间跑完匈牙利
+            row_ind, col_ind = linear_sum_assignment(sub_cost.numpy())
+
+            # 写回到全局 assignment 账本中
+            for r_idx, c_idx in zip(row_ind, col_ind):
+                computed_cost = sub_cost[r_idx, c_idx].item()
+                # 只有真正匹配到线(原先是 valid candidate)的才会记录
+                if computed_cost < LARGE - 1.0:
+                    global_r = r0 + r_idx
+                    global_c = c0 + c_idx
+                    assignment[global_r] = global_c
+                    cost_scores[global_r] = -computed_cost
+            del sub_cost
+            gc.collect()
+    else:
+        # Fallback 贪婪匹配：哪怕没有 SciPy，该算法依然能正常、快速且节约地跑通
+        claimed = torch.zeros(nk_total, dtype=torch.bool)
+        best_sim_per_row = top_sim[:, 0]
+        order = torch.argsort(best_sim_per_row, descending=True).tolist()
+        for r in order:
+            for slot in range(top_k):
+                cand = int(top_idx[r, slot].item())
+                if cand < 0:
+                    continue
+                if not bool(claimed[cand].item()):
+                    assignment[r] = cand
+                    cost_scores[r] = top_sim[r, slot].item()
+                    claimed[cand] = True
+                    break
+    # ==================== 第 3 重处理：基于安全数据结果落定合并 ====================
+    bucket = torch.zeros(nk, h, i, dtype=torch.float32)
+    host_load = torch.zeros(nk, i, dtype=torch.long)
+    hosted_total = 0
+    drop_below_thr_total = 0
+    sims_hosted = []
+    # 进行分配后的阈值检测与融合
+    for d_pos in range(nd):
+        d_id = dropped[d_pos]
+        d_down_f = down[d_id].to(torch.float32)
+        scale = alpha
+        if expert_alpha_scale is not None:
+            scale *= float(expert_alpha_scale.get(int(d_id), 1.0))
+
+        row_lo = d_pos * i
+        keep_e_buf, keep_n_buf, src_buf = [], [], []
+
+        for src_n in range(i):
+            global_row = row_lo + src_n
+            assigned = int(assignment[global_row].item())
+
+            if assigned < 0:
+                drop_below_thr_total += 1
+                continue
+
+            sim_value = float(cost_scores[global_row].item())
+
+            # 【守门员】达不到设定阈值的知识残渣，坚决不要！
+            if sim_value < sim_threshold:
+                drop_below_thr_total += 1
+                continue
+
+            kept_e = assigned // i
+            kept_n = assigned % i
+            keep_e_buf.append(kept_e)
+            keep_n_buf.append(kept_n)
+            src_buf.append(src_n)
+            sims_hosted.append(sim_value)
+            host_load[kept_e, kept_n] += 1
+        if keep_e_buf:
+            host_e = torch.tensor(keep_e_buf, dtype=torch.long)
+            host_n = torch.tensor(keep_n_buf, dtype=torch.long)
+            src = torch.tensor(src_buf, dtype=torch.long)
+            _scatter_down_columns(bucket, d_down_f, host_e, host_n, src, scale)
+            hosted_total += len(keep_e_buf)
+    # 封包生成报告状态
+    sims_t = torch.tensor(sims_hosted, dtype=torch.float32) if sims_hosted else torch.empty(0, dtype=torch.float32)
+
+    stats: dict[str, Any] = {
+        "total_dropped_neurons": nd_total,
+        "hosted": hosted_total,
+        "dropped_below_thr": drop_below_thr_total,
+        "sim_mean_hosted": float(sims_t.mean().item()) if sims_t.numel() else 0.0,
+        "sim_p10_hosted": float(_quantile(sims_t, 0.10)),
+        "sim_p90_hosted": float(_quantile(sims_t, 0.90)),
+        "host_load_max": int(host_load.max().item()) if host_load.numel() else 0,
+        "host_load_histogram": _build_host_load_histogram(host_load),
+    }
+    del kept_super, top_sim, top_idx, assignment, cost_scores
+    gc.collect()
+    return bucket, stats
+
+
+def _candidate_block_hungarian_assignment(
+        top_sim: torch.Tensor,  # [N, K]
+        top_idx: torch.Tensor,  # [N, K]
+        num_cols: int,
+        *,
+        row_block_size: int = 2048,
+        large: float = 1e6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """GPT 贡献的典藏级算法：Memory-safe block Hungarian on a sparse top-K candidate graph."""
+    import numpy as np
+    from scipy.optimize import linear_sum_assignment
+
+    n, k = top_idx.shape
+    assignment = torch.full((n,), -1, dtype=torch.long)
+    score = torch.full((n,), -1.0, dtype=torch.float32)
+
+    claimed = torch.zeros(num_cols, dtype=torch.bool)
+
+    # 优先让最高相似度的行进行匹配，防止后面的块引发排他性冲突
+    row_order = torch.argsort(top_sim[:, 0], descending=True)
+
+    for start in range(0, n, row_block_size):
+        rows = row_order[start:start + row_block_size]
+        if rows.numel() == 0:
+            continue
+
+        block_top_idx = top_idx.index_select(0, rows)
+        block_top_sim = top_sim.index_select(0, rows)
+
+        # 核心过滤：只保留还没被占用的候选列
+        valid = block_top_idx >= 0
+        if claimed.numel() > 0:
+            valid = valid & (~claimed[block_top_idx.clamp_min(0)])
+
+        if not valid.any():
+            continue
+
+        # 收集这个 block "真正"关联到的候选列
+        cand_cols = torch.unique(block_top_idx[valid])
+        cand_cols = cand_cols[cand_cols >= 0]
+
+        if cand_cols.numel() == 0:
+            continue
+
+        # 建立 global 到 local 的索引字典，极速降维！
+        col_to_local = {int(c.item()): j for j, c in enumerate(cand_cols)}
+
+        rb = rows.numel()
+        cb = cand_cols.numel()
+
+        # 生成极小矩阵 [其实只有几 MB]
+        sub_cost = np.full((rb, cb), large, dtype=np.float32)
+
+        b_idx_np = block_top_idx.cpu().numpy()
+        b_sim_np = block_top_sim.cpu().numpy()
+
+        for local_r in range(rb):
+            for slot in range(k):
+                c = int(b_idx_np[local_r, slot])
+                if c < 0 or bool(claimed[c].item()):
+                    continue
+                local_c = col_to_local.get(c)
+                if local_c is None:
+                    continue
+                sub_cost[local_r, local_c] = -float(b_sim_np[local_r, slot])
+
+        # 执行极速的局部匈牙利
+        row_ind, col_ind = linear_sum_assignment(sub_cost)
+
+        for rr, cc in zip(row_ind, col_ind):
+            cost_val = float(sub_cost[rr, cc])
+            if cost_val >= large - 1.0:
+                continue
+
+            global_row = int(rows[rr].item())
+            global_col = int(cand_cols[cc].item())
+
+            # 二次核验：确保多线程/跨块处理时不冲突
+            if bool(claimed[global_col].item()):
+                continue
+
+            assignment[global_row] = global_col
+            score[global_row] = -cost_val
+            claimed[global_col] = True
+
+        del sub_cost
+
+    return assignment, score
+
+
+def _match_global_layer(
+        super_norm: torch.Tensor,
+        down: torch.Tensor,
+        surviving: list[int],
+        dropped: list[int],
+        *,
+        sim_threshold: float,
+        alpha: float,
+        top_k: int,
+        expert_alpha_scale: dict[int, float] | None,
+        expert_chunk: int,
+        scratch_dir: Path | None,
+        layer: int,
+        block_threshold: int,
+        hungarian_blocks: int,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    import gc
+    nk, nd = len(surviving), len(dropped)
+    e, i, two_h = super_norm.shape
+    h = down.shape[1]
+
+    kept_super = super_norm[surviving].reshape(nk * i, two_h).contiguous()
+
+    nd_total = nd * i
+    nk_total = nk * i
+
+    top_sim = torch.full((nd_total, top_k), -1.0, dtype=torch.float32)
+    top_idx = torch.full((nd_total, top_k), -1, dtype=torch.long)
+
+    cache_path = (scratch_dir / f"neuron_match_layer{layer}.pt") if scratch_dir else None
+    cached = (
+        torch.load(cache_path, map_location="cpu", weights_only=True)
+        if cache_path is not None and cache_path.is_file()
+        else None
+    )
+    if cached is not None and cached.get("nd_total") == nd_total and cached.get("nk_total") == nk_total:
+        top_sim = cached["top_sim"]
+        top_idx = cached["top_idx"]
+    else:
+        # GPT/我也认同：维持此处的严格降维 chunk
+        chunk = max(1, min(expert_chunk, 4))
+        for d_start in range(0, nd, chunk):
+            d_end = min(nd, d_start + chunk)
+            d_block = super_norm[[dropped[di] for di in range(d_start, d_end)]]
+            d_flat = d_block.reshape((d_end - d_start) * i, two_h).contiguous()
+
+            sim = d_flat @ kept_super.t()
+            k_eff = min(top_k, sim.shape[1])
+            vals, idx = sim.topk(k_eff, dim=1, largest=True, sorted=True)
+
+            row0 = d_start * i
+            row1 = d_end * i
+            top_sim[row0:row1, :k_eff] = vals
+            top_idx[row0:row1, :k_eff] = idx
+
+            del sim, vals, idx, d_flat, d_block
+
+        if cache_path is not None:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({"nd_total": nd_total, "nk_total": nk_total, "top_sim": top_sim, "top_idx": top_idx}, cache_path)
+
+    del kept_super
+    gc.collect()
+
+    try:
+        from scipy.optimize import linear_sum_assignment
+        scipy_installed = True
+    except ImportError:
+        scipy_installed = False
+
+    if scipy_installed:
+        # ======= 调取 GPT 优化的核心算法 =======
+        assignment, assignment_score = _candidate_block_hungarian_assignment(
+            top_sim,
+            top_idx,
+            num_cols=nk_total,
+            row_block_size=1024,  # 切分更稳
+        )
+    else:
+        # 继续沿用可靠的极速贪婪降级方案
+        assignment = torch.full((nd_total,), -1, dtype=torch.long)
+        assignment_score = torch.full((nd_total,), -1.0, dtype=torch.float32)
+        claimed = torch.zeros(nk_total, dtype=torch.bool)
+        best_sim_per_row = top_sim[:, 0]
+        order = torch.argsort(best_sim_per_row, descending=True).tolist()
+        for r in order:
+            for slot in range(top_k):
+                cand = int(top_idx[r, slot].item())
+                if cand < 0: continue
+                if not bool(claimed[cand].item()):
+                    assignment[r] = cand
+                    assignment_score[r] = top_sim[r, slot].item()
+                    claimed[cand] = True
+                    break
+
+    # ====== 安全过滤与知识灌注 ======
+    bucket = torch.zeros(nk, h, i, dtype=torch.float32)
+    host_load = torch.zeros(nk, i, dtype=torch.long)
+    hosted_total = 0
+    drop_below_thr_total = 0
+    sims_hosted = []
+
+    for d_pos in range(nd):
+        d_id = dropped[d_pos]
+        d_down_f = down[d_id].to(torch.float32)
+
+        scale = alpha
+        if expert_alpha_scale is not None:
+            scale *= float(expert_alpha_scale.get(int(d_id), 1.0))
+
+        row_lo = d_pos * i
+        keep_e_buf, keep_n_buf, src_buf = [], [], []
+
+        for src_n in range(i):
+            global_row = row_lo + src_n
+            assigned = int(assignment[global_row].item())
+
+            if assigned < 0:
+                drop_below_thr_total += 1
+                continue
+
+            # 完全对接 GPT 优化后的得分读取
+            sim_value = float(assignment_score[global_row].item())
+
+            if sim_value < sim_threshold:
+                drop_below_thr_total += 1
+                continue
+
+            kept_e = assigned // i
+            kept_n = assigned % i
+            keep_e_buf.append(kept_e)
+            keep_n_buf.append(kept_n)
+            src_buf.append(src_n)
+            sims_hosted.append(sim_value)
+            host_load[kept_e, kept_n] += 1
+
+        if keep_e_buf:
+            host_e = torch.tensor(keep_e_buf, dtype=torch.long)
+            host_n = torch.tensor(keep_n_buf, dtype=torch.long)
+            src = torch.tensor(src_buf, dtype=torch.long)
+            _scatter_down_columns(bucket, d_down_f, host_e, host_n, src, scale)
+            hosted_total += len(keep_e_buf)
+
+            del keep_e_buf, keep_n_buf, src_buf, host_e, host_n, src
+
+    sims_t = torch.tensor(sims_hosted, dtype=torch.float32) if sims_hosted else torch.empty(0, dtype=torch.float32)
+
+    stats: dict[str, Any] = {
+        "total_dropped_neurons": nd_total,
+        "hosted": hosted_total,
+        "dropped_below_thr": drop_below_thr_total,
+        "sim_mean_hosted": float(sims_t.mean().item()) if sims_t.numel() else 0.0,
+        "sim_p10_hosted": float(_quantile(sims_t, 0.10)),
+        "sim_p90_hosted": float(_quantile(sims_t, 0.90)),
+        "host_load_max": int(host_load.max().item()) if host_load.numel() else 0,
+        "host_load_histogram": _build_host_load_histogram(host_load),
+    }
+
+    del top_sim, top_idx, assignment, assignment_score
+    gc.collect()
+
+    return bucket, stats
+
+def _load_router_stats_scale(
+    path: str | Path,
+    num_layers: int,
+) -> dict[int, dict[int, float]]:
+    """Build per-(layer, expert) alpha multipliers from ``router_stats.json``.
+
+    For every layer, normalize the absolute usage counts so that **dropped
+    experts have mean=1**: ``scale[d] = freq[d] / mean_d freq[d]``. The
+    caller then multiplies this into ``alpha`` for that dropped expert's
+    down-column contribution.
+
+    Surviving experts are NOT scaled (we never inject *their* down
+    columns). All-zero usage layers fall back to a flat 1.0.
+    """
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    out: dict[int, dict[int, float]] = {}
+    for layer in range(num_layers):
+        layer_data = payload.get("layers", {}).get(str(layer))
+        if layer_data is None:
+            continue
+        usage = layer_data.get("usage_counts") or {}
+        if not usage:
+            continue
+        freq_by_id = {int(eid): float(c) for eid, c in usage.items()}
+        # We don't know which experts are dropped here (depends on the surviving
+        # list resolved by the caller). Return the full per-expert map; the
+        # consumer normalizes against its own dropped subset.
+        out[layer] = freq_by_id
+    return out
+
+
+def _normalize_alpha_scale_for_dropped(
+    full_scale: dict[int, dict[int, float]],
+    layer: int,
+    dropped: list[int],
+) -> dict[int, float] | None:
+    """From ``_load_router_stats_scale`` output, build a {dropped_id -> alpha_mult} dict.
+
+    Normalization: for the given dropped ids, divide by their mean usage
+    so the mean alpha multiplier is 1.0. Returns None if the layer has no
+    router stats.
+    """
+    layer_freq = full_scale.get(layer)
+    if layer_freq is None:
+        return None
+    vals = [layer_freq.get(int(d), 0.0) for d in dropped]
+    if not vals:
+        return None
+    mean = sum(vals) / len(vals)
+    if mean <= 0.0:
+        return {int(d): 1.0 for d in dropped}
+    return {int(d): float(layer_freq.get(int(d), 0.0)) / mean for d in dropped}
+
+
+def build_neuron_merge_plan(
+    teacher_dir: str | Path,
+    adapter: MoEAdapter,
+    hf_config: dict[str, Any],
+    surviving_per_layer: dict[int, list[int]],
+    *,
+    strategy: str,                       # "neuron_swiglu_local" | "neuron_swiglu_global"
+    alpha: float = 0.5,
+    sim_threshold: float = 0.5,
+    top_k: int = 4,
+    expert_chunk: int = 16,
+    block_threshold: int = 80_000,
+    hungarian_blocks: int = 8,
+    router_stats_path: str | Path | None = None,
+    scratch_dir: str | Path | None = None,
+    bucket_dir: str | Path | None = None,
+    log: logging.Logger | None = None,
+) -> MergePlan:
+    """Build a SwiGLU-aware neuron-level merge plan.
+
+    See module docstring for strategy semantics. The returned ``MergePlan``
+    has ``mode == "neuron_swiglu"`` and only ``neuron_down_contrib`` is
+    populated (not ``weights``); the slicer treats ``gate_up_proj`` as a
+    plain ``index_select`` of the kept experts and adds the bucket onto
+    the kept ``down_proj``.
+
+    When ``bucket_dir`` is given, each layer's down_proj contribution
+    bucket (``[num_kept, hidden, intermediate]``, ~1.5 GB on Qwen3.5)
+    is ``torch.save``-d to ``bucket_dir/layer{L}.pt`` instead of being
+    held in RAM. ``MergePlan.neuron_down_contrib_paths[layer]`` then
+    points to that file and the slicer loads it just-in-time. This caps
+    resident memory at one bucket regardless of model depth.
+    """
+    log = log or logging.getLogger("moe_prune_distill.expert_merge")
+    if strategy not in ("neuron_swiglu_local", "neuron_swiglu_global"):
+        raise ValueError(f"unknown neuron strategy: {strategy!r}")
+
+    teacher_dir = Path(teacher_dir)
+    num_layers = adapter.get_num_layers(hf_config)
+    num_experts = adapter.get_num_experts(hf_config)
+
+    weight_map = _build_weight_map(teacher_dir)
+    per_layer_expert_keys = _layer_expert_keys(weight_map, num_layers)
+    per_layer_router_keys = _layer_router_keys(weight_map, num_layers)
+
+    full_alpha_scale: dict[int, dict[int, float]] | None = None
+    if router_stats_path is not None:
+        full_alpha_scale = _load_router_stats_scale(router_stats_path, num_layers)
+        log.info(
+            "neuron merge: loaded router stats from %s (layers=%d)",
+            router_stats_path,
+            len(full_alpha_scale),
+        )
+
+    scratch_path = Path(scratch_dir) if scratch_dir is not None else None
+    bucket_path_root = Path(bucket_dir) if bucket_dir is not None else None
+    if bucket_path_root is not None:
+        bucket_path_root.mkdir(parents=True, exist_ok=True)
+
+    plan = MergePlan(alpha=float(alpha), mode="neuron_swiglu")
+    plan.surviving_per_layer = {l: list(v) for l, v in surviving_per_layer.items()}
+    plan.dropped_per_layer = {
+        l: [e for e in range(num_experts) if e not in set(surviving_per_layer.get(l, []))]
+        for l in range(num_layers)
+    }
+    plan.neuron_meta = {
+        "strategy": strategy,
+        "alpha": float(alpha),
+        "sim_threshold": float(sim_threshold),
+        "top_k": int(top_k) if strategy == "neuron_swiglu_global" else None,
+        "router_stats_used": bool(full_alpha_scale is not None),
+    }
+
+    skipped: list[tuple[int, str]] = []
+    for layer in range(num_layers):
+        surviving = list(surviving_per_layer.get(layer, []))
+        dropped = plan.dropped_per_layer[layer]
+        if not surviving or not dropped:
+            continue
+        if layer not in per_layer_expert_keys:
+            skipped.append((layer, "no stacked expert keys"))
+            continue
+        if strategy == "neuron_swiglu_local" and layer not in per_layer_router_keys:
+            skipped.append((layer, "no router gate key (local needs router cosine)"))
+            continue
+
+        _log_process_mem(f"layer {layer} before load", log)
+        gate_up, down = _load_layer_expert_stack(
+            teacher_dir, weight_map, per_layer_expert_keys[layer]
+        )
+        _log_process_mem(f"layer {layer} after load gate_up/down", log)
+
+        try:
+            super_norm, intermediate, hidden = _build_super_vec(gate_up)
+            _log_process_mem(f"layer {layer} after build super_norm", log)
+        except ValueError as exc:
+            skipped.append((layer, f"gate_up shape: {exc}"))
+            del gate_up, down
+            continue
+
+        layer_alpha_scale: dict[int, float] | None = None
+        if full_alpha_scale is not None:
+            layer_alpha_scale = _normalize_alpha_scale_for_dropped(
+                full_alpha_scale, layer, dropped
+            )
+
+        if strategy == "neuron_swiglu_local":
+            router_w = _load_layer_router(
+                teacher_dir, weight_map, per_layer_router_keys[layer]
+            )
+            bucket, stats = _match_local_layer(
+                super_norm,
+                down,
+                surviving,
+                dropped,
+                router_w,
+                sim_threshold=sim_threshold,
+                alpha=alpha,
+                expert_alpha_scale=layer_alpha_scale,
+            )
+            _log_process_mem(f"layer {layer} after match bucket", log)
+            del router_w
+        else:
+            bucket, stats = _match_global_layer(
+                super_norm,
+                down,
+                surviving,
+                dropped,
+                sim_threshold=sim_threshold,
+                alpha=alpha,
+                top_k=top_k,
+                expert_alpha_scale=layer_alpha_scale,
+                expert_chunk=expert_chunk,
+                scratch_dir=scratch_path,
+                layer=layer,
+                block_threshold=block_threshold,
+                hungarian_blocks=hungarian_blocks,
+            )
+            _log_process_mem(f"layer {layer} after match bucket", log)
+
+        if bucket_path_root is not None:
+            bucket_file = bucket_path_root / f"layer{layer}.pt"
+            torch.save(bucket, bucket_file)
+            plan.neuron_down_contrib_paths[layer] = str(bucket_file)
+            del bucket
+        else:
+            plan.neuron_down_contrib[layer] = bucket.contiguous()
+
+        _log_process_mem(f"layer {layer} after save/delete bucket", log)
+        plan.neuron_stats[layer] = stats
+        log.info(
+            "merge layer %d: hosted=%d/%d (%.1f%%) sim_mean=%.3f host_load_max=%d",
+            layer,
+            stats["hosted"],
+            stats["total_dropped_neurons"],
+            100.0 * stats["hosted"] / max(1, stats["total_dropped_neurons"]),
+            stats["sim_mean_hosted"],
+            stats["host_load_max"],
+        )
+        del gate_up, down, super_norm
+        gc.collect()
+        _log_process_mem(f"layer {layer} after cleanup", log)
+    if skipped:
+        preview = [f"{l}({why})" for l, why in skipped[:8]]
+        if len(skipped) > 8:
+            preview.append("...")
+        log.warning(
+            "neuron merge: %d layer(s) skipped (kept exprs index-select with no merge): %s",
+            len(skipped),
+            preview,
+        )
+
+    return plan
