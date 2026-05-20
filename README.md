@@ -16,7 +16,6 @@ pip install -e .
 1. 在example.yaml中设置要蒸馏的模型
 2. 在data_sources.yaml中配置token限制以及HF_TOKEN
 3. stream_teacher会生成大量（40GB~无上限，取决于样本数）中间激活值
-4. 最后一步是sft，不必要
 ```bash
 python -m scripts.download           --config configs/example.yaml                # 下载模型
 python -m scripts.inspect            --config configs/example.yaml
@@ -27,8 +26,10 @@ python -m scripts.prune              --config configs/example.yaml
 # 或者：保留剪掉专家的权重，按相似度融合到留存专家里再走后续步骤
 # python -m scripts.prune_merge      --config configs/example.yaml --merge-strategy weight_cosine --merge-alpha 0.5
 python -m scripts.train_layerwise    --config configs/example.yaml                # 逐 block 蒸馏 (新)
-python -m scripts.train              --config configs/example.yaml \
-    --student-dir-override ./models/student_layerwise --offload-folder ./cache/offload
+#python -m scripts.train              --config configs/example.yaml \
+#    --student-dir-override ./models/student_layerwise --offload-folder ./cache/offload
+# train.py进行SFT LoRA，不必要
+python -m scripts.export_gguf         --config configs/example.yaml               # 转化为gguf，请在example.yaml中配置
 ```
 
 每步说明：
