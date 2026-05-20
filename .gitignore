@@ -1,8 +1,8 @@
-.claude
-.venv
-cache
-configs/data_sources.yaml.bak
-configs/example.yaml.bak
+/.claude
+/.venv
+/cache
+/configs/data_sources.yaml.bak
+/configs/example.yaml.bak
 /data/
 /memory/
 /models/
