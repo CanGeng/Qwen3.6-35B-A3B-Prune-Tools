@@ -10,6 +10,34 @@
 /third_party/
 /DESIGN.md
 /pretty_metrics_log.patch
-*.egg-info/
-*.py[cod]
 .idea/
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Packaging
+*.egg-info/
+.eggs/
+build/
+dist/
+pip-wheel-metadata/
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# Test/cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment variables
+.env
+.env.*
